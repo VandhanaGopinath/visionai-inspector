@@ -1,0 +1,31 @@
+# Stage 1 — Data Analysis & Preprocessing
+numpy
+pandas
+matplotlib
+pillow
+scikit-learn
+scipy
+jupyter
+nbformat
+
+# Stage 3 — Deep Learning (PyTorch)
+torch
+torchvision
+
+# Stage 6 — RAG + LLM
+google-genai
+sentence-transformers
+chromadb
+pyyaml
+
+# App (CV + RAG web interface)
+streamlit
+joblib
+
+# Stages 7+ (not needed yet — listed here so the environment is ready later)
+# opencv-python
+# onnx
+# onnxruntime
+# fastapi
+# uvicorn
+# streamlit
