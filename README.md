@@ -164,6 +164,7 @@ visionai-inspector/
 ├── scripts/
 │   └── export_inference_models.py  # one-time: fits + saves models/ artifacts for the app
 ├── app.py                       # Streamlit web interface (CV + RAG combined)
+├── api.py                       # FastAPI backend (same models, callable by anything)
 ├── requirements.txt
 └── README.md
 ```
@@ -398,3 +399,57 @@ are always visibly labeled, never presented as if Gemini produced them.
   Transformer downloads in this sandbox (both blocked here, same
   restriction as every earlier stage) — both fallback paths were
   exercised and correctly labeled instead.
+
+## API — FastAPI backend
+
+`api.py` exposes the same CV and RAG capabilities as `app.py` through a
+standalone HTTP service, so anything can call your models — not just the
+Streamlit page. No new detection or retrieval logic here either: it wraps
+the exact same `src/` functions, so the API and the Streamlit app will
+always agree with each other. `app.py` is unchanged and still works
+exactly as before — this is an additional way to reach the same models,
+not a replacement.
+
+### Running it
+
+```bash
+python scripts/export_inference_models.py   # if you haven't already
+export GEMINI_API_KEY="your-key-here"
+uvicorn api:app --reload
+```
+
+Interactive docs (try every endpoint from the browser): http://127.0.0.1:8000/docs
+
+### Endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Is everything loaded and ready? Reports detector/localization/RAG status, embeddings backend, device, whether a Gemini key is set. |
+| `POST /predict` | Upload an image → `{label, score, threshold, confidence}`. Classification only. |
+| `POST /detect` | Same as `/predict`, plus a bounding box and (optionally) the annotated image and heatmap as base64 PNGs. |
+| `POST /ask` | `{question, defect_type?, top_k?}` → grounded answer + sources, with the same fallback labeling as the app. |
+| `GET /metrics` | Request counts, error counts, and average latency per endpoint — in-memory, no external monitoring dependency. |
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:8000/predict -F "file=@bottle.jpg"
+curl -X POST http://127.0.0.1:8000/ask -H "Content-Type: application/json" \
+     -d '{"question": "What is contamination?"}'
+```
+
+### What I verified before shipping this
+
+- Every endpoint tested with FastAPI's `TestClient`, which triggers the
+  real startup sequence (model loading, knowledge base embedding) rather
+  than just checking the code parses.
+- `/predict` against a real image returned results identical to `app.py`
+  on the same image — confirming both share the exact same logic.
+- `/detect`'s base64-encoded images were decoded back into real, correctly
+  sized PNGs, not just checked for a non-empty string.
+- `/ask` tested both with and without a `defect_type` filter, confirming
+  the metadata filter narrows results correctly.
+- Error handling tested directly: uploading a non-image file to `/predict`
+  returns a proper `400` with a clear message instead of crashing.
+- `/metrics` confirmed to accumulate real request/error/latency data
+  across calls.

@@ -30,19 +30,23 @@ import warnings
 # otherwise print once per question across the 30-question evaluation loop.
 warnings.filterwarnings("ignore", message="Direct use of automatic function calling.*")
 
-GEMINI_MODEL = "gemini-3.6-flash"
+GEMINI_MODEL = "gemini-2.0-flash"
 
 SYSTEM_PROMPT = """You are a documentation assistant for an industrial bottle inspection system. \
 Answer ONLY using the provided document excerpts below — never your own outside/general knowledge, \
 and never information that isn't explicitly present in the excerpts. Do not invent information.
 
+Audience: a factory floor operator or QA inspector, not an engineer. Write in plain, direct language \
+they can act on immediately — short sentences, no jargon, no hedging filler.
+
 Rules:
-1. If the excerpts contain the answer, answer clearly and concisely, and cite which document/section it came from.
-2. If the excerpts do NOT contain enough information to answer, say exactly: \
+1. If the excerpts contain the answer, answer it directly and completely in 2-5 sentences (or a short \
+numbered list for a procedure). Finish your thought before you cite anything — never end mid-sentence.
+2. After your answer, on a new line, name which document(s) it came from (e.g. "Source: DOC-001, Inspection Procedure").
+3. If the excerpts do NOT contain enough information to answer, say exactly: \
 "The provided documentation does not contain enough information to answer this." \
 Do not guess, estimate, or fill in a plausible-sounding number or procedure.
-3. If multiple excerpts are relevant, synthesize across all of them and cite each one used.
-4. Keep answers concise and useful — do not pad with unnecessary caveats once you've answered.
+4. If multiple excerpts are relevant, synthesize across all of them into one coherent answer, not a list of quotes.
 5. These documents are explicitly simulated/example documentation for a portfolio project, not a real \
 industry standard — if asked whether this is official, say so plainly."""
 
@@ -82,7 +86,7 @@ def _fallback_result(reason: str, detail: str, question: str, retrieved_chunks: 
         f"Would have asked Gemini to answer '{question}' using {len(retrieved_chunks)} retrieved "
         f"chunk(s) from: {doc_ids}."
     )
-    return {"answer": answer, "used_fallback": True, "fallback_reason": reason}
+    return {"answer": answer, "used_fallback": True, "fallback_reason": reason, "was_truncated": False}
 
 
 def generate_answer(question: str, retrieved_chunks: list[dict], client=None, model: str = GEMINI_MODEL) -> dict:
@@ -99,7 +103,10 @@ def generate_answer(question: str, retrieved_chunks: list[dict], client=None, mo
 
     Returns
     -------
-    dict with keys: answer, used_fallback (bool), fallback_reason (str or None)
+    dict with keys: answer, used_fallback (bool), fallback_reason (str or
+    None), was_truncated (bool -- True if Gemini's response was cut off by
+    the token limit before finishing, a real failure mode worth surfacing
+    rather than silently showing a truncated answer as if it were complete)
     """
     if client is None:
         return _fallback_result(
@@ -118,7 +125,7 @@ def generate_answer(question: str, retrieved_chunks: list[dict], client=None, mo
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
                 temperature=0.0,
-                max_output_tokens=500,
+                max_output_tokens=1024,
             ),
         )
         answer_text = response.text
@@ -127,7 +134,13 @@ def generate_answer(question: str, retrieved_chunks: list[dict], client=None, mo
                 "empty_response", "Gemini returned an empty response (possibly blocked by safety filters).",
                 question, retrieved_chunks
             )
-        return {"answer": answer_text, "used_fallback": False, "fallback_reason": None}
+
+        finish_reason = None
+        if response.candidates:
+            finish_reason = getattr(response.candidates[0], "finish_reason", None)
+        was_truncated = finish_reason is not None and str(finish_reason).upper().endswith("MAX_TOKENS")
+
+        return {"answer": answer_text, "used_fallback": False, "fallback_reason": None, "was_truncated": was_truncated}
 
     except errors.ClientError as e:
         code = getattr(e, "code", None)

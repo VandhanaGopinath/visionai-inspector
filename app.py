@@ -18,6 +18,12 @@ app does not claim a defect-type classification; it passes a generic
 "flagged as defective" question to the RAG system rather than inventing a
 type it can't actually determine.
 
+UI design note: technical detail (raw model scores, thresholds, distances)
+is real and accurate, but a factory-floor user shouldn't have to parse it
+to get a straight answer. Every screen leads with a plain-language result;
+technical numbers are one click away in an expander, never hidden or
+fabricated-simpler -- just not front and center.
+
 Run with: streamlit run app.py
 Requires models/ to exist -- run `python scripts/export_inference_models.py` first.
 """
@@ -27,17 +33,16 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import streamlit as st
 import torch
-from PIL import Image, ImageDraw
+from PIL import Image
 import matplotlib.pyplot as plt
 import chromadb
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.append(str(PROJECT_ROOT / "src"))
 
-from inference import load_anomaly_model, predict_anomaly, load_autoencoder_model, compute_localization
+from inference import load_anomaly_model, predict_anomaly, load_autoencoder_model, compute_localization, draw_bounding_box
 from rag_documents import load_knowledge_base
 from rag_embeddings import build_embedder
 from rag_generation import get_gemini_client, generate_answer
@@ -53,11 +58,32 @@ KNOWLEDGE_FILES = [
 ]
 TOP_K = 4
 
+DOC_TITLES = {
+    "DOC-001": "Inspection Procedure (SOP)",
+    "DOC-002": "Defect Definitions Guide",
+    "DOC-003": "QC Acceptance Criteria",
+    "DOC-004": "Corrective Action Guide",
+    "DOC-005": "Troubleshooting Guide",
+}
+
 st.set_page_config(page_title="VisionAI Inspector", page_icon="🔍", layout="wide")
+
+st.markdown("""
+<style>
+.result-card { padding: 1.25rem 1.5rem; border-radius: 0.75rem; margin-bottom: 1rem; }
+.result-normal { background-color: #e8f5e9; border: 1px solid #66bb6a; }
+.result-defective { background-color: #ffebee; border: 1px solid #ef5350; }
+.result-title { font-size: 1.4rem; font-weight: 700; margin-bottom: 0.25rem; }
+.guidance-card { background-color: #f5f7fa; border-left: 4px solid #5c7cfa; padding: 1rem 1.25rem;
+                  border-radius: 0.5rem; margin-bottom: 0.75rem; }
+.source-pill { display: inline-block; background-color: #eef1f8; color: #3b4a6b; padding: 0.15rem 0.6rem;
+               border-radius: 1rem; font-size: 0.8rem; margin: 0.15rem 0.25rem 0.15rem 0; }
+</style>
+""", unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------- cached resource loading
-@st.cache_resource(show_spinner="Loading CV models...")
+@st.cache_resource(show_spinner="Loading models...")
 def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -83,7 +109,7 @@ def get_localization_model():
         return None, None, str(e)
 
 
-@st.cache_resource(show_spinner="Building knowledge base (one-time)...")
+@st.cache_resource(show_spinner="Preparing knowledge base (one-time)...")
 def get_rag_pipeline():
     chunks = load_knowledge_base(KB_DIR, filenames=KNOWLEDGE_FILES)
     embed_documents, embed_query, using_real_embeddings = build_embedder()
@@ -120,123 +146,154 @@ def retrieve(collection, embed_query, query: str, top_k: int = TOP_K, defect_typ
 
 
 FALLBACK_MESSAGES = {
-    "no_api_key": ("warning", "⚠️ No GEMINI_API_KEY found. Set it as an environment variable and restart the app for real answers."),
-    "invalid_api_key": ("error", "❌ Gemini rejected the API key as invalid. Check your GEMINI_API_KEY."),
-    "rate_limit_or_quota": ("warning", "⏳ Gemini rate limit or free-tier quota exceeded. Try again shortly."),
-    "server_error": ("warning", "⚠️ Gemini server error (likely transient) — try again."),
-    "network_error": ("warning", "⚠️ Network error reaching Gemini — check your connection."),
-    "empty_response": ("warning", "⚠️ Gemini returned an empty response (possibly a safety filter)."),
-    "other_error": ("error", "❌ Unexpected error calling Gemini."),
+    "no_api_key": ("warning", "⚠️ No Gemini API key configured. Set GEMINI_API_KEY and restart the app to get real answers."),
+    "invalid_api_key": ("error", "❌ The Gemini API key was rejected. Double check GEMINI_API_KEY."),
+    "rate_limit_or_quota": ("warning", "⏳ Gemini's rate limit or free-tier quota was hit. Wait a bit and try again."),
+    "server_error": ("warning", "⚠️ Gemini had a temporary server error — try again."),
+    "network_error": ("warning", "⚠️ Couldn't reach Gemini — check your internet connection."),
+    "empty_response": ("warning", "⚠️ Gemini didn't return an answer (possibly a safety filter)."),
+    "other_error": ("error", "❌ Something went wrong calling Gemini."),
 }
 
 
-def render_answer(result: dict):
+def render_guidance(result: dict):
     if result["used_fallback"]:
         kind, message = FALLBACK_MESSAGES.get(result["fallback_reason"], ("error", "❌ Generation unavailable."))
         getattr(st, kind)(message)
-        with st.expander("Fallback details (not a real Gemini answer)"):
+        with st.expander("Technical details (not a real answer)"):
             st.code(result["answer"])
-    else:
-        st.markdown(result["answer"])
+        return
+
+    if result.get("was_truncated"):
+        st.warning("⚠️ This answer may have been cut short by a length limit.")
+
+    st.markdown(f'<div class="guidance-card">{result["answer"]}</div>', unsafe_allow_html=True)
 
 
-def render_sources(retrieved: list[dict]):
-    with st.expander(f"📚 Sources ({len(retrieved)} chunks retrieved)"):
+def render_sources(retrieved: list[dict], friendly: bool = True):
+    label = f"📚 Where this came from ({len(retrieved)} document excerpts)"
+    with st.expander(label):
         for r in retrieved:
-            st.markdown(f"**{r['document_id']} — {r['section']}**  _(distance: {r['distance']:.4f})_")
-            st.caption(r["text"][:300] + ("..." if len(r["text"]) > 300 else ""))
+            doc_title = DOC_TITLES.get(r["document_id"], r["document_id"])
+            st.markdown(
+                f'<span class="source-pill">{r["document_id"]} — {doc_title}</span>',
+                unsafe_allow_html=True,
+            )
+            st.caption(f"**{r['section']}**")
+            snippet = r["text"][:280] + ("..." if len(r["text"]) > 280 else "")
+            st.write(snippet)
+            if not friendly:
+                st.caption(f"distance: {r['distance']:.4f}")
+            st.divider()
 
 
 def draw_bbox(image: np.ndarray, bbox) -> Image.Image:
-    img = Image.fromarray(image).convert("RGB")
-    if bbox is not None:
-        draw = ImageDraw.Draw(img)
-        draw.rectangle(bbox, outline="red", width=2)
-    return img
+    return draw_bounding_box(image, bbox, color="red", width=3)
 
 
-# ---------------------------------------------------------------- sidebar status
+# ---------------------------------------------------------------- sidebar
 with st.sidebar:
     st.title("🔍 VisionAI Inspector")
     st.caption("Industrial bottle inspection — CV + RAG demo")
     st.divider()
-    st.subheader("System status")
 
     device = get_device()
-    st.write(f"**Device:** {device}")
-
     anomaly_bundle, anomaly_error = get_anomaly_model()
-    if anomaly_bundle is not None:
-        pretrained_note = "✅ pretrained" if anomaly_bundle["resnet_pretrained"] else "⚠️ random-init fallback"
-        st.write(f"**Anomaly detector:** loaded ({pretrained_note})")
-    else:
-        st.error(f"**Anomaly detector:** not loaded\n\n{anomaly_error}")
-
     autoencoder, pixel_threshold, loc_error = get_localization_model()
-    st.write(f"**Localization model:** {'loaded' if autoencoder is not None else 'not loaded'}")
+    gemini_ready = bool(os.environ.get("GEMINI_API_KEY"))
 
-    st.write(f"**GEMINI_API_KEY set:** {bool(os.environ.get('GEMINI_API_KEY'))}")
+    st.markdown("**System status**")
+    st.write(f"{'🟢' if anomaly_bundle is not None else '🔴'} Defect detector")
+    st.write(f"{'🟢' if autoencoder is not None else '🔴'} Localization")
+    st.write(f"{'🟢' if gemini_ready else '🟡'} Gemini guidance")
+
+    with st.expander("Technical status"):
+        st.write(f"Device: `{device}`")
+        if anomaly_bundle is not None:
+            st.write("Detector backbone:", "pretrained ✅" if anomaly_bundle["resnet_pretrained"] else "random-init fallback ⚠️")
+        st.write("GEMINI_API_KEY set:", gemini_ready)
+        _, _, using_real_embeddings = get_rag_pipeline()
+        st.write("Embeddings:", "Sentence Transformers ✅" if using_real_embeddings else "TF-IDF fallback ⚠️")
 
     st.divider()
-    st.caption(
-        "Scope note: this system detects Normal vs. Defective. It does NOT classify "
-        "*which* defect type is present — that classifier was never built. Guidance "
-        "below is general inspection procedure, not defect-specific advice."
+    st.info(
+        "**Scope note:** this system detects *Normal vs. Defective* only. "
+        "It does **not** identify which specific defect is present — that "
+        "wasn't built. Guidance shown is general inspection procedure, not "
+        "defect-specific advice.",
+        icon="ℹ️",
     )
 
 
 # ---------------------------------------------------------------- main tabs
-tab_inspect, tab_ask = st.tabs(["🖼️ Image Inspection", "💬 Ask a Question"])
+tab_inspect, tab_ask = st.tabs(["🖼️ Inspect an Image", "💬 Ask a Question"])
 
 with tab_inspect:
-    st.header("Image Inspection")
+    st.header("Inspect a bottle image")
 
     if anomaly_bundle is None:
-        st.error("Anomaly detector isn't available. Run `python scripts/export_inference_models.py` first.")
+        st.error("The defect detector isn't set up yet. Run `python scripts/export_inference_models.py` first.")
     else:
-        uploaded_file = st.file_uploader("Upload a bottle image", type=["png", "jpg", "jpeg"])
+        uploaded_file = st.file_uploader("Upload a photo of a bottle", type=["png", "jpg", "jpeg"])
 
         if uploaded_file is not None:
             image = Image.open(uploaded_file)
-            col1, col2 = st.columns(2)
 
-            with col1:
-                st.subheader("Uploaded image")
-                st.image(image, use_container_width=True)
-
-            with st.spinner("Running anomaly detection..."):
+            with st.spinner("Checking the image..."):
                 result = predict_anomaly(image, anomaly_bundle, device)
 
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                st.image(image, use_container_width=True, caption="Uploaded image")
+
             with col2:
-                st.subheader("Detection result")
-                if result["label"] == "Normal":
-                    st.success(f"✅ **{result['label']}**")
-                else:
-                    st.error(f"🚨 **{result['label']}**")
-                st.metric("Anomaly score", f"{result['score']:.4f}", help="Raw One-Class SVM decision_function value. Lower = more anomalous.")
-                st.metric("Decision threshold", f"{result['threshold']:.4f}")
-                st.progress(result["confidence"], text=f"Confidence heuristic: {result['confidence']:.1%} (not a calibrated probability)")
+                is_normal = result["label"] == "Normal"
+                card_class = "result-normal" if is_normal else "result-defective"
+                icon = "✅" if is_normal else "🚨"
+                headline = "Looks Normal" if is_normal else "Defect Detected"
+                subtext = (
+                    "No anomaly found — this bottle looks consistent with a normal, defect-free unit."
+                    if is_normal else
+                    "This bottle looks different from a normal unit and has been flagged for review."
+                )
+                st.markdown(
+                    f'<div class="result-card {card_class}">'
+                    f'<div class="result-title">{icon} {headline}</div>'
+                    f'<div>{subtext}</div></div>',
+                    unsafe_allow_html=True,
+                )
+                st.progress(result["confidence"], text=f"Confidence: {result['confidence']:.0%}")
+
+                with st.expander("Technical details"):
+                    st.write(f"Raw anomaly score: `{result['score']:.4f}`")
+                    st.write(f"Decision threshold: `{result['threshold']:.4f}`")
+                    st.caption(
+                        "Score comes from a One-Class SVM trained only on normal images "
+                        "(Stage 3). Confidence is a simple heuristic derived from distance "
+                        "to the threshold, not a calibrated probability."
+                    )
 
             if autoencoder is not None:
-                st.subheader("Localization (where the anomaly appears to be)")
+                st.subheader("Where's the issue?")
                 loc = compute_localization(image, autoencoder, pixel_threshold, device)
 
-                lcol1, lcol2, lcol3 = st.columns(3)
+                lcol1, lcol2 = st.columns([1, 1])
                 with lcol1:
-                    st.caption("Resized input")
-                    st.image(loc["resized_image"], use_container_width=True)
+                    st.image(
+                        draw_bbox(loc["resized_image"], loc["bounding_box"]),
+                        use_container_width=True,
+                        caption="Highlighted region the model flagged as unusual" if loc["bounding_box"] else "No specific region stood out",
+                    )
                 with lcol2:
-                    fig, ax = plt.subplots(figsize=(3, 3))
-                    ax.imshow(loc["heatmap"], cmap="inferno")
-                    ax.axis("off")
-                    st.caption("Reconstruction-error heatmap")
-                    st.pyplot(fig)
-                with lcol3:
-                    st.caption("Predicted anomalous region")
-                    st.image(draw_bbox(loc["resized_image"], loc["bounding_box"]), use_container_width=True)
+                    with st.expander("Show technical heatmap"):
+                        fig, ax = plt.subplots(figsize=(3, 3))
+                        ax.imshow(loc["heatmap"], cmap="inferno")
+                        ax.axis("off")
+                        st.pyplot(fig)
+                        st.caption("Brighter = more different from what a normal bottle looks like at that pixel.")
 
             st.divider()
-            st.subheader("Inspection guidance")
+            st.subheader("What should I do?")
 
             if result["label"] == "Defective":
                 query = ("A bottle was flagged as DEFECTIVE by the automated inspection system. "
@@ -248,42 +305,37 @@ with tab_inspect:
             collection, embed_query, using_real_embeddings = get_rag_pipeline()
             gemini_client = get_gemini()
 
-            if not using_real_embeddings:
-                st.info("ℹ️ Using TF-IDF fallback embeddings (Sentence Transformer model unavailable).")
-
-            with st.spinner("Retrieving guidance and generating explanation..."):
+            with st.spinner("Looking up guidance..."):
                 retrieved = retrieve(collection, embed_query, query, top_k=TOP_K)
                 gen_result = generate_answer(query, retrieved, client=gemini_client)
 
-            render_answer(gen_result)
+            render_guidance(gen_result)
             render_sources(retrieved)
 
 
 with tab_ask:
-    st.header("Ask a Question")
-    st.caption("Ask anything covered by the inspection documentation (SOP, defect definitions, QC criteria, CAPA, troubleshooting).")
+    st.header("Ask a question")
+    st.caption("Ask anything covered by the inspection documentation — procedures, defect definitions, acceptance criteria, and more.")
 
-    defect_filter = st.selectbox(
-        "Filter by defect type (optional — only if you already know it)",
-        options=[None, "contamination", "broken_small", "broken_large"],
-        format_func=lambda x: "No filter" if x is None else x,
-    )
+    with st.expander("Only if you already know the defect type (optional)"):
+        defect_filter = st.selectbox(
+            "Focus the search on:",
+            options=[None, "contamination", "broken_small", "broken_large"],
+            format_func=lambda x: "No filter — search everything" if x is None else x.replace("_", " ").title(),
+        )
 
-    question = st.text_input("Your question", placeholder="e.g. What is the acceptance criteria for contamination?")
+    question = st.text_input("Your question", placeholder="e.g. What counts as an acceptable amount of contamination?")
 
     if st.button("Ask", type="primary") and question.strip():
         collection, embed_query, using_real_embeddings = get_rag_pipeline()
         gemini_client = get_gemini()
 
-        if not using_real_embeddings:
-            st.info("ℹ️ Using TF-IDF fallback embeddings (Sentence Transformer model unavailable).")
-
-        with st.spinner("Retrieving relevant documentation..."):
+        with st.spinner("Searching the documentation..."):
             retrieved = retrieve(collection, embed_query, question, top_k=TOP_K, defect_type=defect_filter)
 
-        with st.spinner("Generating answer..."):
+        with st.spinner("Writing an answer..."):
             gen_result = generate_answer(question, retrieved, client=gemini_client)
 
         st.subheader("Answer")
-        render_answer(gen_result)
+        render_guidance(gen_result)
         render_sources(retrieved)

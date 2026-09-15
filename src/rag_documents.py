@@ -177,7 +177,7 @@ def parse_evaluation_questions(path: Path) -> list[dict]:
     expected_docs is None for the hallucination/unanswerable category (by
     design, those questions have no correct grounding document).
     """
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8")
     records = []
 
     category_blocks = re.split(r"\n## \d+\.\s*", text)
@@ -221,7 +221,7 @@ def load_knowledge_base(knowledge_base_dir: Path, filenames: list[str] | None = 
         if path.suffix != ".md":
             continue
 
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
         frontmatter, body = _parse_frontmatter(text)
         if not frontmatter:
             continue  # not a knowledge document (e.g. no frontmatter -> metadata schema/question set)

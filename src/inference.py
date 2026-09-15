@@ -29,6 +29,37 @@ from autoencoder import ConvAutoencoder
 AE_EVAL_SIZE = (64, 64)
 
 
+def draw_bounding_box(image_array: np.ndarray, bbox: tuple | None, color: str = "red", width: int = 3) -> Image.Image:
+    """Draw a bounding box on an image array, returning a PIL Image. Shared by app.py and api.py."""
+    from PIL import ImageDraw
+    img = Image.fromarray(image_array).convert("RGB")
+    if bbox is not None:
+        draw = ImageDraw.Draw(img)
+        draw.rectangle(bbox, outline=color, width=width)
+    return img
+
+
+def heatmap_to_image(heatmap: np.ndarray, cmap: str = "inferno") -> Image.Image:
+    """Render a 2D float heatmap array as a viewable RGB PIL Image using a matplotlib colormap."""
+
+    import matplotlib
+
+    normalized = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+
+    colored = (matplotlib.colormaps[cmap](normalized)[:, :, :3] * 255).astype(np.uint8)
+
+    return Image.fromarray(colored)
+
+
+def encode_image_to_base64_png(image: Image.Image) -> str:
+    """Encode a PIL Image as a base64 PNG string, for embedding directly in a JSON API response."""
+    import base64
+    from io import BytesIO
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
 def load_anomaly_model(models_dir: Path, device: torch.device):
     """
     Load the exported ResNet18 + OneClassSVM anomaly detector.

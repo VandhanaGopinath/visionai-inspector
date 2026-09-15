@@ -22,6 +22,11 @@ pyyaml
 streamlit
 joblib
 
+# API backend
+fastapi
+uvicorn[standard]
+python-multipart
+
 # Stages 7+ (not needed yet — listed here so the environment is ready later)
 # opencv-python
 # onnx
