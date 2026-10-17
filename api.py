@@ -54,7 +54,7 @@ from inference import (
 )
 from rag_documents import load_knowledge_base
 from rag_embeddings import build_embedder
-from rag_generation import get_gemini_client, generate_answer
+from rag_generation import get_llm_client, llm_provider_name, generate_answer
 
 MODELS_DIR = PROJECT_ROOT / "models"
 KB_DIR = PROJECT_ROOT / "data" / "knowledge_base"
@@ -143,7 +143,7 @@ async def lifespan(app: FastAPI):
     state["collection"] = collection
     state["embed_query"] = embed_query
     state["using_real_embeddings"] = using_real_embeddings
-    state["gemini_client"] = get_gemini_client()
+    state["gemini_client"] = get_llm_client()  # Gemini or local Ollama
 
     yield  # app runs here
 
@@ -206,6 +206,7 @@ class AskResponse(BaseModel):
     used_fallback: bool
     fallback_reason: Optional[str]
     was_truncated: bool
+    provider: Optional[str] = None   # "gemini" / "ollama" / None when a fallback was returned
     sources: list[SourceChunk]
 
 
@@ -218,6 +219,7 @@ class HealthResponse(BaseModel):
     rag_pipeline_ready: bool
     embeddings_backend: str
     gemini_api_key_set: bool
+    llm_provider: str = "none"   # which engine will answer /ask: gemini, ollama or none
 
 
 class MetricsResponse(BaseModel):
@@ -239,6 +241,7 @@ def health():
         rag_pipeline_ready=state.get("collection") is not None,
         embeddings_backend="sentence-transformers" if state.get("using_real_embeddings") else "tfidf-fallback",
         gemini_api_key_set=bool(os.environ.get("GEMINI_API_KEY")),
+        llm_provider=llm_provider_name(state.get("gemini_client")),
     )
 
 
@@ -311,6 +314,7 @@ def ask(request: AskRequest):
             used_fallback=result["used_fallback"],
             fallback_reason=result.get("fallback_reason"),
             was_truncated=result.get("was_truncated", False),
+            provider=result.get("provider"),
             sources=[SourceChunk(document_id=r["document_id"], section=r["section"], text=r["text"], distance=r["distance"]) for r in retrieved],
         )
     except Exception as e:

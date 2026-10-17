@@ -45,7 +45,7 @@ sys.path.append(str(PROJECT_ROOT / "src"))
 from inference import load_anomaly_model, predict_anomaly, load_autoencoder_model, compute_localization, draw_bounding_box
 from rag_documents import load_knowledge_base
 from rag_embeddings import build_embedder
-from rag_generation import get_gemini_client, generate_answer
+from rag_generation import get_llm_client, llm_provider_name, generate_answer
 
 MODELS_DIR = PROJECT_ROOT / "models"
 KB_DIR = PROJECT_ROOT / "data" / "knowledge_base"
@@ -68,18 +68,15 @@ DOC_TITLES = {
 
 st.set_page_config(page_title="VisionAI Inspector", page_icon="🔍", layout="wide")
 
-st.markdown("""
-<style>
-.result-card { padding: 1.25rem 1.5rem; border-radius: 0.75rem; margin-bottom: 1rem; }
-.result-normal { background-color: #e8f5e9; border: 1px solid #66bb6a; }
-.result-defective { background-color: #ffebee; border: 1px solid #ef5350; }
-.result-title { font-size: 1.4rem; font-weight: 700; margin-bottom: 0.25rem; }
-.guidance-card { background-color: #f5f7fa; border-left: 4px solid #5c7cfa; padding: 1rem 1.25rem;
-                  border-radius: 0.5rem; margin-bottom: 0.75rem; }
-.source-pill { display: inline-block; background-color: #eef1f8; color: #3b4a6b; padding: 0.15rem 0.6rem;
-               border-radius: 1rem; font-size: 0.8rem; margin: 0.15rem 0.25rem 0.15rem 0; }
-</style>
-""", unsafe_allow_html=True)
+# NOTE: earlier versions of this app used custom-colored <div> HTML for
+# result/guidance cards. That broke badly under Streamlit's dark theme --
+# the hardcoded light background combined with the theme's light text
+# color produced barely-readable text (confirmed from a real screenshot).
+# Fixed by dropping custom-colored HTML entirely in favor of Streamlit's
+# native st.container(border=True) + st.success/st.error/st.markdown,
+# which automatically use readable, theme-correct colors in both light
+# and dark mode -- this eliminates the whole bug class rather than
+# patching one color value.
 
 
 # ---------------------------------------------------------------- cached resource loading
@@ -129,7 +126,8 @@ def get_rag_pipeline():
 
 @st.cache_resource(show_spinner=False)
 def get_gemini():
-    return get_gemini_client()
+    """Returns the active answer-generation client (Gemini or local Ollama); name kept for minimal diff."""
+    return get_llm_client()
 
 
 def retrieve(collection, embed_query, query: str, top_k: int = TOP_K, defect_type: str | None = None) -> list[dict]:
@@ -146,7 +144,10 @@ def retrieve(collection, embed_query, query: str, top_k: int = TOP_K, defect_typ
 
 
 FALLBACK_MESSAGES = {
-    "no_api_key": ("warning", "⚠️ No Gemini API key configured. Set GEMINI_API_KEY and restart the app to get real answers."),
+    "no_api_key": ("warning", "⚠️ No answer engine available. Either set GEMINI_API_KEY in your .env file, or install Ollama (ollama.com) and run `ollama pull llama3.2:3b`, then restart the app."),
+    "ollama_not_running": ("warning", "⚠️ Ollama isn't running. Start the Ollama app (or run `ollama serve`) and try again."),
+    "ollama_model_missing": ("error", "❌ The local model isn't downloaded yet. Run `ollama pull llama3.2:3b` (or the model set in OLLAMA_MODEL)."),
+    "model_not_found": ("error", "❌ The configured Gemini model is no longer available. Run `python scripts/list_gemini_models.py`, then set GEMINI_MODEL in your .env file."),
     "invalid_api_key": ("error", "❌ The Gemini API key was rejected. Double check GEMINI_API_KEY."),
     "rate_limit_or_quota": ("warning", "⏳ Gemini's rate limit or free-tier quota was hit. Wait a bit and try again."),
     "server_error": ("warning", "⚠️ Gemini had a temporary server error — try again."),
@@ -167,7 +168,8 @@ def render_guidance(result: dict):
     if result.get("was_truncated"):
         st.warning("⚠️ This answer may have been cut short by a length limit.")
 
-    st.markdown(f'<div class="guidance-card">{result["answer"]}</div>', unsafe_allow_html=True)
+    with st.container(border=True):
+        st.markdown(result["answer"])
 
 
 def render_sources(retrieved: list[dict], friendly: bool = True):
@@ -175,11 +177,7 @@ def render_sources(retrieved: list[dict], friendly: bool = True):
     with st.expander(label):
         for r in retrieved:
             doc_title = DOC_TITLES.get(r["document_id"], r["document_id"])
-            st.markdown(
-                f'<span class="source-pill">{r["document_id"]} — {doc_title}</span>',
-                unsafe_allow_html=True,
-            )
-            st.caption(f"**{r['section']}**")
+            st.markdown(f"**{r['document_id']} — {doc_title}**  ·  _{r['section']}_")
             snippet = r["text"][:280] + ("..." if len(r["text"]) > 280 else "")
             st.write(snippet)
             if not friendly:
@@ -201,17 +199,21 @@ with st.sidebar:
     anomaly_bundle, anomaly_error = get_anomaly_model()
     autoencoder, pixel_threshold, loc_error = get_localization_model()
     gemini_ready = bool(os.environ.get("GEMINI_API_KEY"))
+    llm_client = get_gemini()
+    provider = llm_provider_name(llm_client)
 
     st.markdown("**System status**")
     st.write(f"{'🟢' if anomaly_bundle is not None else '🔴'} Defect detector")
     st.write(f"{'🟢' if autoencoder is not None else '🔴'} Localization")
-    st.write(f"{'🟢' if gemini_ready else '🟡'} Gemini guidance")
+    provider_label = {"gemini": "Gemini (cloud)", "ollama": "Ollama (local)", "none": "not available"}[provider]
+    st.write(f"{'🟢' if provider != 'none' else '🟡'} Guidance engine: {provider_label}")
 
     with st.expander("Technical status"):
         st.write(f"Device: `{device}`")
         if anomaly_bundle is not None:
             st.write("Detector backbone:", "pretrained ✅" if anomaly_bundle["resnet_pretrained"] else "random-init fallback ⚠️")
         st.write("GEMINI_API_KEY set:", gemini_ready)
+        st.write("Active LLM provider:", provider)
         _, _, using_real_embeddings = get_rag_pipeline()
         st.write("Embeddings:", "Sentence Transformers ✅" if using_real_embeddings else "TF-IDF fallback ⚠️")
 
@@ -248,7 +250,6 @@ with tab_inspect:
 
             with col2:
                 is_normal = result["label"] == "Normal"
-                card_class = "result-normal" if is_normal else "result-defective"
                 icon = "✅" if is_normal else "🚨"
                 headline = "Looks Normal" if is_normal else "Defect Detected"
                 subtext = (
@@ -256,13 +257,13 @@ with tab_inspect:
                     if is_normal else
                     "This bottle looks different from a normal unit and has been flagged for review."
                 )
-                st.markdown(
-                    f'<div class="result-card {card_class}">'
-                    f'<div class="result-title">{icon} {headline}</div>'
-                    f'<div>{subtext}</div></div>',
-                    unsafe_allow_html=True,
-                )
-                st.progress(result["confidence"], text=f"Confidence: {result['confidence']:.0%}")
+                with st.container(border=True):
+                    if is_normal:
+                        st.success(f"**{icon} {headline}**")
+                    else:
+                        st.error(f"**{icon} {headline}**")
+                    st.write(subtext)
+                    st.progress(result["confidence"], text=f"Confidence: {result['confidence']:.0%}")
 
                 with st.expander("Technical details"):
                     st.write(f"Raw anomaly score: `{result['score']:.4f}`")

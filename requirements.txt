@@ -14,6 +14,7 @@ torchvision
 
 # Stage 6 — RAG + LLM
 google-genai
+python-dotenv
 sentence-transformers
 chromadb
 pyyaml

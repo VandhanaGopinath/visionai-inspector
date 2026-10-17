@@ -41,13 +41,9 @@ def draw_bounding_box(image_array: np.ndarray, bbox: tuple | None, color: str = 
 
 def heatmap_to_image(heatmap: np.ndarray, cmap: str = "inferno") -> Image.Image:
     """Render a 2D float heatmap array as a viewable RGB PIL Image using a matplotlib colormap."""
-
-    import matplotlib
-
+    import matplotlib.cm as cm
     normalized = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
-
-    colored = (matplotlib.colormaps[cmap](normalized)[:, :, :3] * 255).astype(np.uint8)
-
+    colored = (cm.get_cmap(cmap)(normalized)[:, :, :3] * 255).astype(np.uint8)
     return Image.fromarray(colored)
 
 

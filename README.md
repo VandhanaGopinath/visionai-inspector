@@ -453,3 +453,32 @@ curl -X POST http://127.0.0.1:8000/ask -H "Content-Type: application/json" \
   returns a proper `400` with a clear message instead of crashing.
 - `/metrics` confirmed to accumulate real request/error/latency data
   across calls.
+
+
+## Gemini setup (key + model)
+
+1. Create a key in Google AI Studio. Copy `.env.example` to `.env` and paste the key after `GEMINI_API_KEY=`.
+   `.env` is gitignored and loaded automatically (python-dotenv), so it works in any terminal. Alternatively,
+   set it in the SAME terminal that launches the app. In Windows PowerShell: `$env:GEMINI_API_KEY="your-key"`.
+   `export` only works on Linux/macOS, and `setx` only affects new terminals.
+2. Gemini model names get retired (`gemini-2.0-flash` now returns HTTP 404). Run
+   `python scripts/list_gemini_models.py` to see the models your key can use, then set `GEMINI_MODEL=<name>` in `.env`.
+   The default is the alias `gemini-flash-latest`.
+
+
+## Local LLM option: Ollama (no API key, no quota)
+
+Answer generation can run fully on your machine through [Ollama](https://ollama.com), behind the same
+`generate_answer()` call. Setup:
+
+1. Install Ollama and start it (the desktop app runs it automatically; otherwise `ollama serve`).
+2. `ollama pull llama3.2:3b` (about 2 GB; any chat model works, set `OLLAMA_MODEL` to use another).
+3. Leave `GEMINI_API_KEY` unset, or force it with `LLM_PROVIDER=ollama` in `.env`. Restart the app.
+
+`LLM_PROVIDER` is `auto` by default: Gemini if a key is set, otherwise Ollama if it is running with the model
+pulled. The sidebar and `GET /health` (`llm_provider`) show which engine is active, and `/ask` returns the
+`provider` that produced each answer. Fallback messages are labelled and are never presented as real answers.
+
+Caveat: small local models follow the "refuse if not in the documents" rule less reliably than Gemini.
+Re-run the 30-question evaluation with Ollama and compare the refusal rate before trusting it. I have not
+measured it; the Ollama path was tested only against a simulated Ollama server, not a real model.
