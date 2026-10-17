@@ -43,6 +43,7 @@ from torch_dataset import BottleDataset
 from pretrained_features import build_resnet_feature_extractor, extract_features
 from evaluation import calibrate_threshold, calibrate_pixel_threshold
 from autoencoder import ConvAutoencoder
+import monitoring
 
 CATEGORY = "bottle"
 RANDOM_SEED = 42
@@ -104,6 +105,20 @@ def main():
     bundle = {"scaler": scaler, "ocsvm": ocsvm, "threshold": threshold, "resnet_pretrained": resnet_pretrained}
     joblib.dump(bundle, models_dir / "resnet_ocsvm_bundle.joblib")
     print(f"Saved -> {models_dir / 'resnet_ocsvm_bundle.joblib'}  (threshold={threshold:.4f}, pretrained={resnet_pretrained})")
+
+    # Stage 10 reference: score + image-statistic distributions of NORMAL validation images, plus a
+    # version hash of the model file, so the monitoring module can later detect drift in production.
+    from PIL import Image
+    val_stats = [monitoring.image_stats(Image.open(fp).convert("RGB")) for fp in val_df["filepath"]]
+    reference = monitoring.build_reference(
+        scores=val_scores,
+        brightness=[v["brightness"] for v in val_stats],
+        contrast=[v["contrast"] for v in val_stats],
+        model_version=monitoring.compute_model_version(models_dir / "resnet_ocsvm_bundle.joblib"),
+        source="normal validation images" + (" (SYNTHETIC PLACEHOLDER)" if using_synthetic else ""),
+    )
+    monitoring.save_reference(reference, models_dir / "monitoring_reference.json")
+    print(f"Saved -> {models_dir / 'monitoring_reference.json'}  (model_version={reference['model_version']})")
 
     # ---------------------------------------------------------------- Model A: autoencoder (reuse Stage 3 weights if present)
     print("\n--- Preparing autoencoder for localization (Stage 4's approach) ---")

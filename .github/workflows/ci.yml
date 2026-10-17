@@ -1,0 +1,13 @@
+name: tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      # Light install: the monitoring and LLM-provider tests need no PyTorch. The ONNX and API
+      # tests skip themselves automatically when torch / exported models are not available.
+      - run: pip install numpy pandas scipy pillow pytest google-genai python-dotenv
+      - run: python -m pytest tests -q

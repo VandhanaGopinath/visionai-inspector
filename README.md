@@ -1,4 +1,56 @@
-# VisionAI Inspector — Stage 1: Data Analysis & Preprocessing
+# VisionAI Inspector
+
+An end-to-end AI/ML portfolio project: **industrial bottle inspection** with computer vision, a RAG-based
+assistant that answers from inspection documentation, a REST API, a web app, edge optimization (ONNX +
+int8), monitoring with drift detection, and Docker packaging. Built stage by stage on the public
+[MVTec AD](https://www.mvtec.com/company/research/datasets/mvtec-ad) `bottle` category.
+
+```
+Image -> anomaly detector (ResNet18 + One-Class SVM) -> Normal / Defective + score
+      -> localization (autoencoder error map) -> bounding box + heatmap
+      -> RAG (Sentence Transformers + ChromaDB + Gemini or local Ollama) -> grounded operator guidance
+      -> every prediction logged -> drift / health monitoring
+```
+
+## Status
+
+| Stage | What | State |
+|---|---|---|
+| 1 | Data analysis and protocol-faithful split | done |
+| 2 | Classical ML anomaly detection (OCSVM / Isolation Forest) | done |
+| 3 | Deep learning (autoencoder, pretrained ResNet18) | done |
+| 4 | Localization / segmentation (IoU, Dice) | done |
+| 5 | Vision Transformer vs CNN comparison | done |
+| 6 | RAG + LLM (Gemini free tier or local Ollama) | done |
+| 7 | Vision-language model | **not built** (intentionally out of scope) |
+| 8 | FastAPI backend (`/predict /detect /ask /health /metrics /monitoring`) | done |
+| 9 | Edge optimization: ONNX + int8 quantization | done, benchmark script included |
+| 10 | Monitoring: logging, health summary, PSI/KS drift | done |
+| 11 | Docker + deployment | files written and validated; image build not run by me (see below) |
+
+Known limits, stated plainly:
+- The system answers **Normal vs. Defective** only. It does not classify the defect type.
+- The knowledge-base documents are simulated, written for this project. They are not a real standard.
+- Numbers in the stage sections come from notebook runs. Anything marked *smoke test* was produced on
+  synthetic data or random weights to check the code, and is not a result.
+- Monitoring without production labels can show that inputs or scores **changed**, not that accuracy **dropped**.
+- Small local LLMs (Ollama) follow the "refuse if not in the documents" rule less reliably than Gemini.
+  Re-run the notebook 06 evaluation with your provider and read the refusal rate before relying on it.
+
+## Quick start
+
+```bash
+pip install -r requirements.txt            # same on Windows PowerShell
+python scripts/export_inference_models.py  # fits + saves models/ (needs the dataset in data/raw/)
+streamlit run app.py                       # web app on http://localhost:8501
+uvicorn api:app --reload                   # API on http://localhost:8000/docs
+python -m pytest tests -q                  # tests (pip install -r requirements-dev.txt first)
+```
+Answers need either `GEMINI_API_KEY` in `.env` or a local Ollama (see the Gemini and Ollama sections below).
+
+---
+
+# Stage 1: Data Analysis & Preprocessing
 
 ## Dataset choice: MVTec AD (category: `bottle`)
 
@@ -147,7 +199,9 @@ visionai-inspector/
 │   ├── 03_deep_learning_anomaly_detection.ipynb
 │   ├── 04_defect_localization.ipynb
 │   ├── 05_vision_transformers.ipynb
-│   └── 06_rag_llm.ipynb
+│   ├── 06_rag_llm.ipynb
+│   ├── 09_edge_optimization.ipynb   # reads the Stage 9 benchmark report
+│   └── 10_monitoring.ipynb          # PSI / KS drift explained with a simulation
 ├── src/
 │   ├── data_utils.py          # reusable, documented loading/preprocessing functions
 │   ├── features.py             # hand-crafted feature extraction (Stage 2)
@@ -159,13 +213,21 @@ visionai-inspector/
 │   ├── benchmarking.py          # parameter count / model size / inference latency (Stage 5)
 │   ├── rag_documents.py         # knowledge base parsing + evaluation question parsing (Stage 6)
 │   ├── rag_embeddings.py        # local Sentence Transformer embeddings, with offline fallback (Stage 6)
-│   ├── rag_generation.py        # Gemini-based grounded generation (Stage 6)
+│   ├── rag_generation.py        # grounded generation: Gemini or local Ollama (Stage 6)
+│   ├── onnx_optimization.py     # ONNX export, int8 quantization, size/latency/memory measurement (Stage 9)
+│   ├── monitoring.py            # prediction log, PSI/KS drift, health summary (Stage 10)
 │   └── inference.py             # single-image inference wrappers for the app (reuses Stage 3+4 logic)
 ├── scripts/
-│   └── export_inference_models.py  # one-time: fits + saves models/ artifacts for the app
-├── app.py                       # Streamlit web interface (CV + RAG combined)
+│   ├── export_inference_models.py  # one-time: fits + saves models/ artifacts + drift reference
+│   ├── benchmark_onnx.py           # Stage 9: ONNX + int8 benchmark -> reports/
+│   └── list_gemini_models.py       # which Gemini models your key can use
+├── tests/                       # pytest: monitoring, LLM providers, ONNX, API
+├── app.py                       # Streamlit web interface (inspect, ask, monitoring)
 ├── api.py                       # FastAPI backend (same models, callable by anything)
-├── requirements.txt
+├── Dockerfile, docker-compose.yml, .dockerignore   # Stage 11
+├── .github/workflows/ci.yml     # runs the tests on every push
+├── DEPLOYMENT.md
+├── requirements.txt, requirements-dev.txt
 └── README.md
 ```
 
@@ -482,3 +544,79 @@ pulled. The sidebar and `GET /health` (`llm_provider`) show which engine is acti
 Caveat: small local models follow the "refuse if not in the documents" rule less reliably than Gemini.
 Re-run the 30-question evaluation with Ollama and compare the refusal rate before trusting it. I have not
 measured it; the Ollama path was tested only against a simulated Ollama server, not a real model.
+
+
+## Stage 9 — Edge AI optimization (ONNX + quantization)
+
+Goal: make the vision backbone smaller and faster for a CPU-only edge device, and **measure** what that costs.
+
+```bash
+python scripts/export_inference_models.py   # once
+python scripts/benchmark_onnx.py            # exports ONNX, quantizes, measures, writes reports/stage9_onnx_benchmark.md
+```
+
+It compares four variants of the ResNet18 feature extractor on your machine:
+**PyTorch fp32, ONNX fp32, ONNX int8 (static, calibrated on 50 normal *train* images), ONNX int8 (dynamic)**.
+For each it reports file size, CPU latency (mean/p50/p95, batch of 1), peak memory of a fresh process, feature
+fidelity against PyTorch (cosine similarity, max difference), and the effect on the real task: ROC-AUC and
+Normal/Defective agreement on the untouched MVTec test set (using the exported OCSVM head).
+
+Concepts worth being able to explain:
+- **ONNX** is a framework-neutral model format; ONNX Runtime executes it with optimized CPU kernels.
+- **Static quantization** stores weights as int8 and needs *calibration* images to learn activation ranges.
+  Calibration uses the normal train split only; using test images would leak test information.
+- **Dynamic quantization** needs no calibration but is designed for Linear/MatMul layers, so it is often not a
+  win for a convolutional network. It is in the comparison so that this is shown, not assumed.
+- Whether int8 is *faster* depends on the CPU (int8 instructions such as VNNI). Size shrinks about 4x
+  regardless. Latency and accuracy impact must be read from **your** benchmark output.
+
+There are no benchmark numbers in this README on purpose. The only run I could do was a smoke test on synthetic
+data with random weights. It confirmed the pipeline works, and showed int8 static being *slower* than ONNX fp32
+on my sandbox CPU, which is exactly why you measure. Run the script on the real data and paste your table here.
+
+## Stage 10 — Monitoring
+
+What happens after deployment. Every prediction (API and Streamlit) is appended to `logs/predictions.jsonl`
+with timestamp, **model version** (hash of the model file), label, score, confidence, latency and image
+brightness/contrast. `src/monitoring.py` then provides:
+
+- **Health summary:** counts, share of Defective predictions, confidence, latency p50/p95, per model version.
+- **Drift detection** against a reference saved by the export script (normal validation images):
+  *PSI* (how much the distribution moved: <0.1 stable, 0.1-0.25 moderate, >0.25 major) and the *KS test*
+  (is the shift larger than chance). A signal is flagged only when both agree, KS limits are Bonferroni-corrected
+  for testing three signals, PSI bins adapt to sample size (PSI is biased upward on small samples), and no
+  verdict is given below 30 logged predictions or with a reference of fewer than 20 images.
+- Surfaces: `GET /monitoring` (JSON) and the **Monitoring** tab in the app.
+
+Measured by simulation (300-400 trials per cell, normal-distributed brightness, reference of 200 images; see
+notebook 10): the false-alarm rate was about 4-5% at 30, 100 and 500 samples, and a brightness shift of one
+standard deviation was detected in about 98% of trials even at 30 samples (a half-standard-deviation shift:
+about 45% at 30 samples, 85% at 100, and essentially always at 500). That is a simulation of the statistics, not a
+claim about your real camera.
+
+Limits: no production labels means no accuracy tracking. A real deployment would also route a sample of bottles
+to human review. Notebook `10_monitoring.ipynb` walks through the statistics.
+
+## Stage 11 — Docker and deployment
+
+```bash
+python scripts/export_inference_models.py     # creates ./models (mounted into the containers)
+docker compose up --build                     # UI :8501, API :8000, shared monitoring log
+```
+
+The image installs CPU-only PyTorch, bakes in the sentence-embedding model and ImageNet ResNet18 weights (so it
+runs offline afterwards), and runs as a non-root user. Models are **not** in the image because they are fitted on
+your data; they are mounted read-only. Put `GEMINI_API_KEY` in `.env` (read by compose) or run Ollama on the host
+(compose points the containers at `host.docker.internal:11434`). See `DEPLOYMENT.md` for hosting options.
+
+Honest status: I validated `docker-compose.yml` (`docker compose config`), ran the API under uvicorn, and ran the
+exact health-check command against it. I could not build the image in my environment (no Docker daemon), so the
+first `docker compose up --build` on your machine is the real test.
+
+## Tests
+
+`python -m pytest tests -q` covers: PSI/KS drift logic (no false alarm on the same distribution, drift on a
+brightness shift, no verdict on tiny samples), the prediction log, LLM provider selection and fallbacks (Gemini
+retry, daily quota, 404, Ollama present/absent, using a fake Ollama server), ONNX export fidelity and
+quantization, and the API end to end (health, predict, monitoring, drift flagged, `/ask` fallback, bad upload).
+The ONNX and API tests skip themselves when PyTorch or the exported models are missing, so CI stays light.

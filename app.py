@@ -46,6 +46,9 @@ from inference import load_anomaly_model, predict_anomaly, load_autoencoder_mode
 from rag_documents import load_knowledge_base
 from rag_embeddings import build_embedder
 from rag_generation import get_llm_client, llm_provider_name, generate_answer
+import monitoring
+import time
+import pandas as pd
 
 MODELS_DIR = PROJECT_ROOT / "models"
 KB_DIR = PROJECT_ROOT / "data" / "knowledge_base"
@@ -122,6 +125,20 @@ def get_rag_pipeline():
     collection.add(ids=[c["chunk_id"] for c in chunks], embeddings=chunk_vectors.tolist(), metadatas=metadatas, documents=chunk_texts)
 
     return collection, embed_query, using_real_embeddings
+
+
+MONITORING_LOG = Path(os.environ.get("MONITORING_LOG", PROJECT_ROOT / "logs" / "predictions.jsonl"))
+
+
+@st.cache_resource(show_spinner=False)
+def get_monitor():
+    """Model version hash, drift reference and prediction logger (Stage 10)."""
+    version = monitoring.compute_model_version(MODELS_DIR / "resnet_ocsvm_bundle.joblib")
+    return {
+        "version": version,
+        "reference": monitoring.load_reference(MODELS_DIR / "monitoring_reference.json"),
+        "logger": monitoring.PredictionLogger(MONITORING_LOG, version),
+    }
 
 
 @st.cache_resource(show_spinner=False)
@@ -228,7 +245,7 @@ with st.sidebar:
 
 
 # ---------------------------------------------------------------- main tabs
-tab_inspect, tab_ask = st.tabs(["🖼️ Inspect an Image", "💬 Ask a Question"])
+tab_inspect, tab_ask, tab_monitor = st.tabs(["🖼️ Inspect an Image", "💬 Ask a Question", "📈 Monitoring"])
 
 with tab_inspect:
     st.header("Inspect a bottle image")
@@ -242,7 +259,19 @@ with tab_inspect:
             image = Image.open(uploaded_file)
 
             with st.spinner("Checking the image..."):
+                _t0 = time.perf_counter()
                 result = predict_anomaly(image, anomaly_bundle, device)
+                _latency_ms = (time.perf_counter() - _t0) * 1000
+
+            # Log each uploaded file once (Streamlit re-runs this script on every click).
+            _file_key = f"{uploaded_file.name}-{uploaded_file.size}"
+            if st.session_state.get("last_logged_file") != _file_key:
+                try:
+                    get_monitor()["logger"].log(source="streamlit", label=result["label"], score=result["score"],
+                                                confidence=result["confidence"], latency_ms=_latency_ms, image=image)
+                    st.session_state["last_logged_file"] = _file_key
+                except Exception as e:  # monitoring must never break an inspection
+                    print(f"WARNING: monitoring log failed: {e}")
 
             col1, col2 = st.columns([1, 1])
             with col1:
@@ -340,3 +369,53 @@ with tab_ask:
         st.subheader("Answer")
         render_guidance(gen_result)
         render_sources(retrieved)
+
+
+with tab_monitor:
+    st.header("Model monitoring")
+    st.caption("What happens after deployment: are predictions, inputs and speed still behaving like they did "
+               "when the model was set up? Every inspection made in this app or through the API is logged.")
+
+    monitor = get_monitor()
+    log_df = monitoring.read_log(MONITORING_LOG)
+    summary = monitoring.summarize(log_df)
+
+    if summary["total_predictions"] == 0:
+        st.info("No inspections logged yet. Upload an image in the first tab and come back.")
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Inspections", summary["total_predictions"])
+        c2.metric("Flagged defective", f"{summary['defective_rate']:.0%}")
+        c3.metric("Avg confidence", f"{summary['confidence_mean']:.0%}")
+        c4.metric("Median speed", f"{summary['latency_ms']['p50']:.0f} ms")
+
+        drift = monitoring.drift_report(monitor["reference"], log_df, monitor["version"])
+        status_msg = {
+            "ok": ("success", "✅ No drift detected: inputs and scores look like the normal reference images."),
+            "warning": ("warning", "⚠️ Moderate shift detected in at least one signal. Worth a look."),
+            "drift": ("error", "🚨 Significant drift detected. Inspect the camera, lighting or product batch."),
+            "insufficient_data": ("info", f"Not enough data for a drift verdict yet ({drift['n_samples']} logged, "
+                                          f"need {monitoring.MIN_SAMPLES})."),
+            "no_reference": ("warning", "No drift reference found. Run `python scripts/export_inference_models.py`."),
+            "reference_mismatch": ("warning", "The drift reference belongs to a different model version. Re-run the export script."),
+        }[drift["status"]]
+        getattr(st, status_msg[0])(status_msg[1])
+
+        if drift["features"]:
+            st.dataframe(
+                pd.DataFrame(drift["features"]).T[["status", "psi", "ks_p_value", "reference_mean", "current_mean"]],
+                use_container_width=True,
+            )
+            st.caption("PSI < 0.1 stable, 0.1-0.25 moderate shift, > 0.25 major shift. Compared with normal validation "
+                       "images. With no production labels this shows that data changed, not that accuracy dropped.")
+
+        st.subheader("Over time")
+        plot_df = log_df.reset_index().rename(columns={"index": "inspection #"}).set_index("inspection #")
+        st.line_chart(plot_df[["score"]], height=180)
+        st.line_chart(plot_df[["latency_ms"]], height=180)
+
+        with st.expander("Technical details"):
+            st.write("Model version:", f"`{monitor['version']}`")
+            st.write("Log file:", f"`{MONITORING_LOG}`")
+            st.json(summary)
+            st.dataframe(log_df.tail(50), use_container_width=True)

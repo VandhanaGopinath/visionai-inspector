@@ -28,10 +28,12 @@ fastapi
 uvicorn[standard]
 python-multipart
 
+# Stage 9 — Edge AI optimization (ONNX export + int8 quantization)
+onnx
+onnxruntime
+psutil
+
+# Stage 10 — monitoring uses numpy / scipy / pandas (already above)
+
 # Stages 7+ (not needed yet — listed here so the environment is ready later)
 # opencv-python
-# onnx
-# onnxruntime
-# fastapi
-# uvicorn
-# streamlit

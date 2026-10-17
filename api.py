@@ -55,8 +55,10 @@ from inference import (
 from rag_documents import load_knowledge_base
 from rag_embeddings import build_embedder
 from rag_generation import get_llm_client, llm_provider_name, generate_answer
+import monitoring
 
 MODELS_DIR = PROJECT_ROOT / "models"
+MONITORING_LOG = Path(os.environ.get("MONITORING_LOG", PROJECT_ROOT / "logs" / "predictions.jsonl"))
 KB_DIR = PROJECT_ROOT / "data" / "knowledge_base"
 KNOWLEDGE_FILES = [
     "01_bottle_inspection_sop.md", "02_defect_definitions_guide.md", "03_qc_acceptance_criteria.md",
@@ -127,6 +129,11 @@ async def lifespan(app: FastAPI):
         state["pixel_threshold"] = None
         print(f"WARNING: localization model not loaded: {e}")
 
+    # Stage 10 monitoring: version hash + reference distributions + prediction log
+    state["model_version"] = monitoring.compute_model_version(MODELS_DIR / "resnet_ocsvm_bundle.joblib")
+    state["monitor_reference"] = monitoring.load_reference(MODELS_DIR / "monitoring_reference.json")
+    state["prediction_logger"] = monitoring.PredictionLogger(MONITORING_LOG, state["model_version"])
+
     chunks = load_knowledge_base(KB_DIR, filenames=KNOWLEDGE_FILES)
     embed_documents, embed_query, using_real_embeddings = build_embedder()
     chunk_texts = [c["text"] for c in chunks]
@@ -165,6 +172,15 @@ def _retrieve(query: str, top_k: int = TOP_K, defect_type: Optional[str] = None)
         retrieved.append({"chunk_id": chunk_id, "text": doc_text, "document_id": meta["document_id"],
                            "section": meta["section"], "distance": distance})
     return retrieved
+
+
+def _log_prediction(endpoint: str, image, result: dict, latency_ms: float) -> None:
+    """Append one monitoring record. Logging must never break a prediction, so errors are swallowed."""
+    try:
+        state["prediction_logger"].log(source=endpoint, label=result["label"], score=result["score"],
+                                       confidence=result["confidence"], latency_ms=latency_ms, image=image)
+    except Exception as e:  # noqa: BLE001
+        print(f"WARNING: monitoring log failed: {type(e).__name__}: {e}")
 
 
 # ---------------------------------------------------------------- request/response schemas
@@ -219,6 +235,7 @@ class HealthResponse(BaseModel):
     rag_pipeline_ready: bool
     embeddings_backend: str
     gemini_api_key_set: bool
+    model_version: str = "unknown"
     llm_provider: str = "none"   # which engine will answer /ask: gemini, ollama or none
 
 
@@ -241,8 +258,21 @@ def health():
         rag_pipeline_ready=state.get("collection") is not None,
         embeddings_backend="sentence-transformers" if state.get("using_real_embeddings") else "tfidf-fallback",
         gemini_api_key_set=bool(os.environ.get("GEMINI_API_KEY")),
+        model_version=state.get("model_version", "unknown"),
         llm_provider=llm_provider_name(state.get("gemini_client")),
     )
+
+
+@app.get("/monitoring")
+def get_monitoring(last_n: int = 1000):
+    """Stage 10: prediction-health summary + drift report vs. the normal-validation reference."""
+    df = monitoring.read_log(MONITORING_LOG, last_n=last_n)
+    version = state.get("model_version")
+    return {
+        "model_version": version,
+        "summary": monitoring.summarize(df),
+        "drift": monitoring.drift_report(state.get("monitor_reference"), df, version),
+    }
 
 
 @app.get("/metrics", response_model=MetricsResponse)
@@ -261,7 +291,9 @@ async def predict(file: UploadFile = File(...)):
     try:
         image = Image.open(io.BytesIO(await file.read()))
         result = predict_anomaly(image, state["anomaly_bundle"], state["device"])
-        metrics.record("/predict", (time.perf_counter() - start) * 1000)
+        latency_ms = (time.perf_counter() - start) * 1000
+        metrics.record("/predict", latency_ms)
+        _log_prediction("/predict", image, result, latency_ms)
         return PredictResponse(**result)
     except Exception as e:
         metrics.record("/predict", (time.perf_counter() - start) * 1000, is_error=True)
@@ -292,7 +324,9 @@ async def detect(file: UploadFile = File(...), include_images: bool = True):
                 annotated_b64 = encode_image_to_base64_png(annotated)
                 heatmap_b64 = encode_image_to_base64_png(heatmap_to_image(loc["heatmap"]))
 
-        metrics.record("/detect", (time.perf_counter() - start) * 1000)
+        latency_ms = (time.perf_counter() - start) * 1000
+        metrics.record("/detect", latency_ms)
+        _log_prediction("/detect", image, result, latency_ms)
         return DetectResponse(**result, bounding_box=bbox_model, annotated_image_png_base64=annotated_b64, heatmap_png_base64=heatmap_b64)
     except HTTPException:
         raise

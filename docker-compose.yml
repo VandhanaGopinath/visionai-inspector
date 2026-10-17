@@ -1,0 +1,38 @@
+# docker compose up --build        (UI on :8501, API on :8000)
+# Before the first run:  python scripts/export_inference_models.py   (creates ./models)
+services:
+  api:
+    build: .
+    ports: ["8000:8000"]
+    env_file:
+      - path: .env          # optional: GEMINI_API_KEY / GEMINI_MODEL / LLM_PROVIDER
+        required: false
+    environment:
+      MONITORING_LOG: /app/logs/predictions.jsonl
+      # Reach an Ollama server running on the host machine (no key, no quota):
+      OLLAMA_HOST: http://host.docker.internal:11434
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes:
+      - ./models:/app/models:ro
+      - logs:/app/logs
+    restart: unless-stopped
+
+  ui:
+    build: .
+    command: ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]
+    ports: ["8501:8501"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      MONITORING_LOG: /app/logs/predictions.jsonl
+      OLLAMA_HOST: http://host.docker.internal:11434
+      HEALTH_PORT: "8501"
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes:
+      - ./models:/app/models:ro
+      - logs:/app/logs          # shared with the API, so the Monitoring tab sees API traffic too
+    restart: unless-stopped
+
+volumes:
+  logs:

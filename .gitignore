@@ -5,3 +5,5 @@ data/processed/
 models/
 .streamlit/
 .env
+logs/
+reports/*.json
